@@ -1,7 +1,7 @@
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
-from optimizer import sgd_cps, adam_cps
+from optimizer import Adam_CPS, SGD_CPS
 
 
 def process_pulse_log(logs, path, stage):
@@ -41,12 +41,12 @@ def process_pulse_log(logs, path, stage):
 
 
 def get_optim(optim_param):
-	if optim_param['optim'] == 'sgd' or optim_param['optim'] == 'sgd_cps':
-		optim = sgd_cps.SGD_CPS(lr=optim_param['lr'], momentum=optim_param['momentum'], nesterov=optim_param['nesterov'])
-	elif optim_param['optim'] == 'adam' or optim_param['optim'] == 'adam_cps':
-		optim = adam_cps.Adam_CPS(lr=optim_param['lr'], betas=optim_param['betas'], amsgrad=optim_param['amsgrad'])
+	if optim_param['optim'] == 'sgd_cps' or optim_param['optim'] == 'sgd':
+		optim = SGD_CPS(lr=optim_param['lr'], momentum=optim_param['momentum'], nesterov=optim_param['nesterov'])
+	elif optim_param['optim'] == 'adam_cps' or  optim_param['optim'] == 'adam':
+		optim = Adam_CPS(lr=optim_param['lr'], betas=optim_param['betas'], amsgrad=optim_param['amsgrad'])
 	else:
-		raise NotImplementedError('only accept dsdg and dadam')
+		raise NotImplementedError('only accept sdg_cps and adam_cps')
 	return optim
 
 
@@ -71,3 +71,23 @@ def subplot(R, P, Q, S,save_name=''):
 	plt.savefig(save_name)
 	plt.show()
 
+def plot_pulse(pulses,save_dir='', name=''):
+	plt.figure()
+
+	T_ps = pulses[-1]['T_ps']
+	max_power = max(pulses[0]['I'])
+	AT = pulses[-1]['I']/max_power
+	AT0 = pulses[0]['I']/max_power
+	plt.plot(T_ps, AT,label='Final_pulse')
+	plt.plot(T_ps, AT0, label='Init_pulse')
+	plt.legend()
+
+	plt.title('Pulses')
+	plt.xlabel('T_ps')
+	plt.ylabel('A.U.')
+	plt.title(name)
+	#plt.ylim((0,1))
+	if len(save_dir)>0 and len(name)>0:
+		plt.savefig(save_dir+name+'pulse.png')
+	plt.show()
+	plt.close()

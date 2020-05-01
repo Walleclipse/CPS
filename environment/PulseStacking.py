@@ -2,11 +2,20 @@
 from scipy import constants
 import numpy as np
 from functools import partial
+import pynlo
 import math
 
 polarization_mark={'p':'^ (up)','-p':'v (down)','s':'-> (in)','-s':'<- (out)'}
 _C_mmps = constants.value('speed of light in vacuum') * 1e3 / 1e12 # light speed of  mm/ps
 
+def copy_pulse(pulse):
+	new_pulse = pynlo.light.PulseBase.Pulse()
+	new_pulse.set_NPTS(pulse.NPTS)
+	new_pulse.set_time_window_ps(pulse.time_window_ps)
+	new_pulse.set_center_wavelength_nm(pulse.center_wavelength_nm)
+	new_pulse._frep_MHz = pulse.frep_MHz
+	new_pulse.set_AW(pulse.AW)
+	return new_pulse
 
 class PhotoDetector:
 	def intensity(self,num):
@@ -24,10 +33,61 @@ class PhotoDetector:
 	def avg_f2_power(self,num):
 		return self.integrate_num(self.intensity(self.f2_amp(num)))
 
-avg_f2_power = PhotoDetector().avg_f2_power
+def pulse_power(pulse):
+	return 1e9 * pulse.dT_mks * PhotoDetector().avg_power(pulse.AT)
 
 def pulse_f2_power(pulse):
-	return 1e9 * pulse.dT_mks * avg_f2_power(pulse.AT)
+	return 1e9 * pulse.dT_mks * PhotoDetector().avg_f2_power(pulse.AT)
+
+def combine_trains(trains):
+	pulse_s=None
+	pulse_p=None
+	s_aw = 0
+	p_aw=0
+	for pulse_info in trains:
+		pu_dict = pulse_info['pulse']
+		pu_s = pu_dict['s']
+		pu_p = pu_dict['p']
+		if pu_s is not None:
+			s_aw += pu_s.AW
+			if pulse_s is None:
+				pulse_s = copy_pulse(pu_s)
+		if pu_p is not None:
+			p_aw += pu_p.AW
+			if pulse_p is None:
+				pulse_p = copy_pulse(pu_p)
+
+	if pulse_s is not None:
+		pulse_s.set_AW(s_aw)
+
+	if pulse_p is not None:
+		pulse_p.set_AW(p_aw)
+
+	pulse_dict = {'p': pulse_p, 's': pulse_s}
+	return pulse_dict
+
+def detect(pulse_dict):
+	pu_s = pulse_dict['s']
+	pu_p = pulse_dict['p']
+	I=0.
+	pulse=None
+	T_ps=0
+	if pu_s is not None:
+		I_s = PhotoDetector().intensity(pu_s.AT)
+		I += I_s
+		pulse= pu_s
+		T_ps = pu_s.T_ps
+	if pu_p is not None:
+		I_p = PhotoDetector().intensity(pu_p.AT)
+		I += I_p
+		pulse = pu_p
+		T_ps = pu_p.T_ps
+
+	f2_I = PhotoDetector().f2_amp(I)
+	f2_power = 1e9 * pulse.dT_mks * PhotoDetector().integrate_num(f2_I)
+	ret_pulse={'I':I,'T_ps':T_ps}
+	return ret_pulse,  f2_power
+
 
 def init_PZM_l0(stage=3,frep_MHZ=1000):
 	period = 1e6/frep_MHZ # ps
@@ -74,24 +134,30 @@ class PhaseModulator:
 		p_s_delay = self.ps_delay *period
 		pulse_train=[]
 		for ind in range(self.num_pulse):
-			new_p = pulse.create_cloned_pulse()
+			#new_p = pulse.create_cloned_pulse()
+			new_p = copy_pulse(pulse)
 			new_phase = phases[ind]
 			if ind%2==0:
-				new_delay = -(ind*period/2)
+				new_delay = (ind*period/2)
 			else:
-				new_delay = -((ind-1)*period/2 + p_s_delay)
+				new_delay = ((ind-1)*period/2 + p_s_delay)
 			new_p.set_frep_MHz(new_frep)
 			new_p.add_time_offset(new_delay)
-			pulse_info = {'pulse':new_p,'phase':new_phase,'displacement':0,'delay_avg':new_delay,'delay_diff':0,'name':'orig_'+str(ind)}
+			if '-' in new_phase:
+				new_p.apply_phase_W(np.pi)
+			pulse_dict={'p':None,'s':None}
+			pulse_dict[new_phase[-1]] = new_p
+			pulse_info = {'pulse':pulse_dict,'phase':new_phase,'displacement':0,'delay':new_delay,'name':'orig_'+str(ind)}
 			pulse_train.append(pulse_info)
 		return pulse_train
 
 class StackStage:
-	def __init__(self,PZM_fold=1, PZM_l0=0,optim_l0=0 ,noise_type='gauss',noise_mean=0., noise_sigma=1.,seed=None,name='s1'):
+	def __init__(self,PZM_fold=1, PZM_l0=0,optim_l0=0 ,noise_type='gauss',noise_mean=0., noise_sigma=1.,QWP_angle=45,seed=None,name='s1'):
 		self.fold = PZM_fold
 		self.l0 = PZM_l0
 		self.noise_sigma = noise_sigma
 		self.optim_l0 = optim_l0
+		self.QWP_angle= QWP_angle # degree
 		if seed is not None:
 			np.random.seed(seed)
 		if noise_type=='gauss':
@@ -101,6 +167,8 @@ class StackStage:
 
 		self.name = name
 		self.L = self.l0
+		self.qwp_cos = math.cos(np.pi*self.QWP_angle/180)
+		self.qwp_sin = math.sin(np.pi*self.QWP_angle/180)
 
 	def _phase_postset(self,p1,p2):
 		inp_ps=set([p1,p2])
@@ -130,27 +198,56 @@ class StackStage:
 
 	def infer(self,pulse_train):
 		d = self.cal_displacement()
-		offset_ps = d / _C_mmps
+		offset_ps = - d / _C_mmps
 		new_pulse_train = []
 		n = len(pulse_train)
 		for ind in range(0,n,2):
 			pulse_info1,pulse_info2 = pulse_train[ind],pulse_train[ind+1]
-			pu1 = pulse_info1['pulse']; ph1 = pulse_info1['phase']; de1 = pulse_info1['delay_avg']; na1 =pulse_info1['name']
-			pu2 = pulse_info2['pulse']; ph2 = pulse_info2['phase']; de2 = pulse_info2['delay_avg']; na2 = pulse_info2['name']
-			pu1 = pu1.create_cloned_pulse()
-			if ph1 in ['s','-s']:
-				pu1.add_time_offset(offset_ps)
+			pu1_dict = pulse_info1['pulse']; ph1 = pulse_info1['phase']; de1 = pulse_info1['delay']; na1 =pulse_info1['name']
+			pu2_dict = pulse_info2['pulse']; ph2 = pulse_info2['phase']; de2 = pulse_info2['delay']; na2 = pulse_info2['name']
+
+			pu1_s = pu1_dict['s']
+			pu2_s = pu2_dict['s']
+			new_aw= 0
+			pu_s=None
+			if pu1_s is not None:
+				pu1_s = copy_pulse(pu1_s)
+				pu1_s.add_time_offset(offset_ps)
 				de1 += offset_ps
-			if ph2 in ['s','-s']:
-				pu2 = pu2.create_cloned_pulse()
-				pu2.add_time_offset(offset_ps)
+				new_aw += pu1_s.AW
+				pu_s = pu1_s
+			if pu2_s is not None:
+				pu2_s = copy_pulse(pu2_s)
+				pu2_s.add_time_offset(offset_ps)
 				de2 += offset_ps
-			#pu3 = pu1.create_cloned_pulse()
-			new_at = math.sqrt(1 / 2) * (pu1.AT + pu2.AT)
-			pu1.set_AT(new_at)
+				new_aw += pu2_s.AW
+				pu_s = pu2_s
+			pu_s.set_AW(new_aw)
+
+			pu1_p = pu1_dict['p']
+			pu2_p = pu2_dict['p']
+			new_aw= 0
+			pu_p=None
+			if pu1_p is not None:
+				new_aw += pu1_p.AW
+				pu_p = copy_pulse(pu1_p)
+			if pu2_p is not None:
+				new_aw += pu2_p.AW
+				if pu_p is None:
+					pu_p = copy_pulse(pu2_p)
+			pu_p.set_AW(new_aw)
+
+			new_p_pulse = copy_pulse(pu_s)
+			new_p_pulse.set_AW(self.qwp_cos*(pu_p.AW + pu_s.AW))
+
+			new_s_pulse = copy_pulse(pu_p)
+			new_s_pulse.set_AW(self.qwp_sin*(pu_p.AW - pu_s.AW))
+			new_s_pulse.apply_phase_W(np.pi)
+
 			new_phase = self._phase_postset(ph1,ph2)
 			new_name = self.name + '_' + (na1.split('_')[-1]+ '&' +na2.split('_')[-1])
-			pulse_info = {'pulse':pu1,'phase':new_phase,'displacement':self.L,'delay_avg':(de1+de2)/2,'delay_diff':de1-de2,'name':new_name}
+			pulse_dict={'p':new_p_pulse,'s':new_s_pulse}
+			pulse_info = {'pulse':pulse_dict,'phase':new_phase,'displacement':d,'delay':(de1+de2)/2,'name':new_name}
 			new_pulse_train.append(pulse_info)
 
 		return new_pulse_train
