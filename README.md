@@ -1,4 +1,4 @@
-# Modified stochastic gradient algorithms for controlling coherent pulse stacking
+# Modified stochastic parallel gradient algorithms
 
 ## Modified SG algorithms
 The generic framework for stochastic gradient (SG) based algorithms.  
